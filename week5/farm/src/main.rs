@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
+use std::{ collections::VecDeque, thread::Thread };
 #[allow(unused_imports)]
-use std::sync::{Arc, Mutex};
+use std::sync::{ Arc, Mutex };
 use std::time::Instant;
 #[allow(unused_imports)]
-use std::{env, process, thread};
+use std::{ env, process, thread };
 
 /// Determines whether a number is prime. This function is taken from CS 110 factor.py.
 ///
@@ -13,7 +13,7 @@ fn is_prime(num: u32) -> bool {
     if num <= 1 {
         return false;
     }
-    for factor in 2..((num as f64).sqrt().floor() as u32) {
+    for factor in 2..(num as f64).sqrt().floor() as u32 {
         if num % factor == 0 {
             return false;
         }
@@ -70,13 +70,41 @@ fn main() {
     let num_threads = num_cpus::get();
     println!("Farm starting on {} CPUs", num_threads);
     let start = Instant::now();
-
-    // TODO: call get_input_numbers() and store a queue of numbers to factor
-
-    // TODO: spawn `num_threads` threads, each of which pops numbers off the queue and calls
-    // factor_number() until the queue is empty
-
-    // TODO: join all the threads you created
+    // let numbers = get_input_numbers();
+    let numbers = vec![
+        379123821,
+        1283712930,
+        123871231,
+        1238172301,
+        128371293,
+        781236812,
+        126491123,
+        129371923,
+        1248917249
+    ];
+    let mut threads = vec![];
+    let deque_arc = Arc::new(Mutex::new(numbers));
+    for _ in 0..num_threads {
+        let local_arc = deque_arc.clone();
+        threads.push(
+            // 1.move arc from iterator to closure
+            thread::spawn(move || {
+                // use expression to pop value,
+                // by the end of expression, mutex drop and unlocked
+                let num: Option<u32> = {
+                    let mut numbers = local_arc.lock().unwrap();
+                    (*numbers).pop()
+                };
+                // use if let to factor
+                if let Some(n) = num {
+                    factor_number(n);
+                }
+            })
+        );
+    }
+    for handle in threads {
+        handle.join().unwrap(); // 等待线程结束
+    }
 
     println!("Total execution time: {:?}", start.elapsed());
 }
