@@ -6,6 +6,7 @@ int main(int argc, char *argv[]) {
     unsigned long num_seconds;
     if (argc != 2 || (num_seconds = strtoul(argv[1], NULL, 10)) == 0) {
         fprintf(stderr, "Usage: %s <seconds to sleep>\n", argv[0]);
+        fprintf(stderr, "argc: %d <seconds to sleep>\n", argc);
         exit(1);
     }
     for (unsigned long i = 0; i < num_seconds; i++) {

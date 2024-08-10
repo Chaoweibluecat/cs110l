@@ -32,9 +32,7 @@ where
                 let res = f(rec.item);
                 sender.send(ResultUnit{idx:rec.idx, res}).expect("send message failed");
             }
-            // 使用完之后关闭channel!
-            // drop(recvr);
-            // drop(sender);
+            // 使用完之后无需要手动drop channel;move进来的clone生命周期自然结束
         });
     }
     drop(input_receiver);
@@ -42,6 +40,7 @@ where
     for (i, ele) in input_vec.into_iter().enumerate() {
         input_sender.send(InputUnit {idx:i, item:(ele)}).expect("send success");
     }
+    // 主线程及时关闭输入通道,避免子线程block在recv上
     drop(input_sender);
     output_vec.reserve(len);
     unsafe {
