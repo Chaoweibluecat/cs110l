@@ -1,5 +1,13 @@
-use crossbeam_channel;
-use std::{thread, time};
+use crossbeam_channel::{self, Receiver, Sender};
+use std::{thread::{self, Thread}, time};
+pub struct InputUnit<T> {
+    idx : usize,
+    item : T
+}
+pub struct ResultUnit<U> {
+    idx : usize,
+    res : U
+}
 
 fn parallel_map<T, U, F>(mut input_vec: Vec<T>, num_threads: usize, f: F) -> Vec<U>
 where
@@ -7,8 +15,41 @@ where
     T: Send + 'static,
     U: Send + 'static + Default,
 {
-    let mut output_vec: Vec<U> = Vec::with_capacity(input_vec.len());
-    // TODO: implement parallel map!
+    // countDownLatch
+    let len = input_vec.len();
+    let mut output_vec: Vec<U> = Vec::with_capacity(len);
+    // 主线程给子进程send T, block在recvT上
+    let (input_sender,input_receiver):(Sender<InputUnit<T>>, Receiver<InputUnit<T>>)  = crossbeam_channel::bounded(input_vec.len());
+    let (res_sender,res_receiver):(Sender<ResultUnit<U>>, Receiver<ResultUnit<U>>)  = crossbeam_channel::bounded(input_vec.len());
+
+    for _ in 0..num_threads {
+        // make local copy of channel endpoint!
+        let recvr = input_receiver.clone();
+        let sender = res_sender.clone();
+        // move channel endpoint to thread 
+        thread::spawn(move || {
+            while let Ok(rec) = recvr.recv() {
+                let res = f(rec.item);
+                sender.send(ResultUnit{idx:rec.idx, res}).expect("send message failed");
+            }
+            // 使用完之后关闭channel!
+            // drop(recvr);
+            // drop(sender);
+        });
+    }
+    drop(input_receiver);
+    drop(res_sender);
+    for (i, ele) in input_vec.into_iter().enumerate() {
+        input_sender.send(InputUnit {idx:i, item:(ele)}).expect("send success");
+    }
+    drop(input_sender);
+    output_vec.reserve(len);
+    unsafe {
+        output_vec.set_len(len);
+    }
+    while let Ok(res) = res_receiver.recv() {
+        output_vec[res.idx] = res.res;
+    }
     output_vec
 }
 
