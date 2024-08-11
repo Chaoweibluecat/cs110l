@@ -40,7 +40,7 @@ async fn setup(n_upstreams: usize) -> (BalanceBeam, Vec<Box<dyn Server>>) {
 /// upstream servers
 #[tokio::test]
 async fn test_load_distribution() {
-    let n_upstreams = 3;
+    let n_upstreams: usize = 3;
     let n_requests = 90;
     let (balancebeam, mut upstreams) = setup(n_upstreams).await;
 
@@ -78,6 +78,11 @@ async fn test_load_distribution() {
     }
 
     log::info!("All done :)");
+}
+
+#[tokio::test]
+async fn simple_test() {
+    assert!(true);
 }
 
 async fn try_failover(balancebeam: &BalanceBeam, upstreams: &mut Vec<Box<dyn Server>>) {

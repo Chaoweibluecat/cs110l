@@ -21,6 +21,8 @@ async fn test_simple_connections() {
         .get("/first_url")
         .await
         .expect("Error sending request to balancebeam");
+    log::info!("response as follows: {:?}", response_text);
+
     assert!(response_text.contains("GET /first_url HTTP/1.1"));
     assert!(response_text.contains("x-sent-by: balancebeam-tests"));
     assert!(response_text.contains("x-forwarded-for: 127.0.0.1"));
@@ -77,6 +79,7 @@ async fn test_multiple_requests_per_connection() {
                     .text()
                     .await
                     .expect("Balancebeam replied with a malformed response");
+                log::info!("response as follows: {:?}", response_text);
                 assert!(response_text.contains(&format!("GET {} HTTP/1.1", path)));
             }
         }));

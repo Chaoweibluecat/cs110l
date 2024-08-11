@@ -1,8 +1,15 @@
 mod request;
 mod response;
 use clap::Parser;
+use core::panic;
 use rand::{Rng, SeedableRng};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    collections::HashMap,
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread,
+};
+use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -10,32 +17,19 @@ use std::net::{TcpListener, TcpStream};
 #[command(about = "Fun with load balancing")]
 struct CmdOptions {
     // about = "IP/port to bind to",
-    #[arg(
-        short,
-        long,
-        default_value = "0.0.0.0:1100"
-    )]
+    #[arg(short, long, default_value = "0.0.0.0:1100")]
     bind: String,
     // about = "Upstream host to forward requests to"
     #[arg(short, long)]
     upstream: Vec<String>,
     //  about = "Perform active health checks on this interval (in seconds)",
-    #[arg(
-        long,
-        default_value = "10"
-    )]
-    // about = "Path to send request to for active health checks",
+    #[arg(long, default_value = "2000")]
     active_health_check_interval: usize,
-    #[arg(
-    long,
-    default_value = "/"
-    )]
-    // about = "Maximum number of requests to accept per IP per minute (0 = unlimited)",
+    // about = "Path to send request to for active health checks",
+    #[arg(long, default_value = "/")]
     active_health_check_path: String,
-    #[arg(
-        long,
-        default_value = "0"
-    )]
+    // about = "Maximum number of requests to accept per IP per minute (0 = unlimited)",
+    #[arg(long, default_value = "100")]
     max_requests_per_minute: usize,
 }
 
@@ -54,7 +48,10 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: Vec<String>,
+    upstream_addresses: Arc<Mutex<Vec<String>>>,
+    /// Addresses of servers that currently failed
+    failed_upstream_addresses: Arc<Mutex<Vec<String>>>,
+    request_counter: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 fn main() {
@@ -84,29 +81,126 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = ProxyState {
-        upstream_addresses: options.upstream,
+    let state = Arc::new(ProxyState {
+        upstream_addresses: Arc::new(Mutex::new(options.upstream)),
+        failed_upstream_addresses: Arc::new(Mutex::new(vec![])),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-    };
+        request_counter: Arc::new(Mutex::new(HashMap::new())),
+    });
+    spawn_active_check(state.clone());
+    spawn_counter_clearer(state.clone());
+
+    let n_workers = 8;
+    let pool = ThreadPool::new(n_workers);
+
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+            let local_state = state.clone();
+            pool.execute(move || {
+                handle_connection(stream, local_state);
+            })
             // Handle the connection!
-            handle_connection(stream, &state);
         }
     }
 }
 
-fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+fn spawn_counter_clearer(state: Arc<ProxyState>) {
+    let arc_counter = state.request_counter.clone();
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(60));
+        arc_counter.lock().unwrap().clear();
+    });
+}
+
+fn spawn_active_check(state: Arc<ProxyState>) {
+    let local_arc_alive = state.upstream_addresses.clone();
+    let local_arc_failed = state.failed_upstream_addresses.clone();
+    let health_path = state.active_health_check_path.clone();
+    let interval = state.active_health_check_interval;
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_millis(interval as u64));
+        let mut ips: Vec<String> = local_arc_alive.lock().unwrap().clone();
+        ips.extend(local_arc_failed.lock().unwrap().clone());
+        let mut new_alive = vec![];
+        let mut new_failed = vec![];
+        for ele in ips {
+            if is_active(&ele, &health_path) {
+                new_alive.push(ele);
+            } else {
+                new_failed.push(ele);
+            }
+        }
+        {
+            let mut alive = local_arc_alive.lock().unwrap();
+            alive.clear();
+            alive.extend(new_alive);
+        }
+        {
+            let mut failed = local_arc_failed.lock().unwrap();
+            failed.clear();
+            failed.extend(new_failed);
+        }
+    });
+}
+
+fn is_active(ip: &String, path: &String) -> bool {
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(path)
+        .header("Host", ip)
+        .body(Vec::new())
+        .unwrap();
+    match TcpStream::connect(&ip) {
+        Ok(mut connection) => match request::write_to_stream(&request, &mut connection) {
+            Ok(_) => match response::read_from_stream(&mut connection, request.method()) {
+                Ok(response) => response.status().as_u16() == 200,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn connect_to_upstream_once(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    let upstream_ip = {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let upstream_ref = state.upstream_addresses.lock().unwrap();
+        if upstream_ref.is_empty() {
+            panic!("no available sub ");
+        }
+        let upstream_idx = rng.gen_range(0, upstream_ref.len());
+        upstream_ref[upstream_idx].clone()
+    };
+    // 此前的锁只是为了从state中读一个ip出来, 在有io时不要给upstream数组上锁
+    match TcpStream::connect(&upstream_ip) {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            log::error!("Failed to connect to upstream {}: {}", &upstream_ip, err);
+            // passive fail over
+            // upstream_ip lifecycle is over,so we can use state as mut ref;
+            let mut upstreams = state.upstream_addresses.lock().unwrap();
+            if let Some(idx) = upstreams.iter().position(|x| *x == upstream_ip) {
+                upstreams.swap_remove(idx);
+            }
+            state
+                .failed_upstream_addresses
+                .lock()
+                .unwrap()
+                .push(upstream_ip);
+            Err(err)
+        }
+    }
+}
+
+fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    let mut res = connect_to_upstream_once(state.clone());
+    while res.is_err() {
+        res = connect_to_upstream_once(state.clone());
+    }
+    res
 }
 
 fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
@@ -118,12 +212,12 @@ fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>
     }
 }
 
-fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
+fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state) {
+    let mut upstream_conn = match connect_to_upstream(state.clone()) {
         Ok(stream) => stream,
         Err(_error) => {
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
@@ -138,7 +232,21 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
     loop {
         // Read a request from the client
         let mut request = match request::read_from_stream(&mut client_conn) {
-            Ok(request) => request,
+            Ok(request) => {
+                let mut counter = state.request_counter.lock().unwrap();
+                if !counter.contains_key(&client_ip) {
+                    counter.insert(client_ip.clone(), 0);
+                }
+                let request_times = *counter.get(&client_ip).unwrap();
+                if request_times >= state.max_requests_per_minute {
+                    let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                    send_response(&mut client_conn, &response);
+                    continue;
+                } else {
+                    counter.insert(client_ip.clone(), request_times + 1);
+                }
+                request
+            }
             // Handle case where client closed connection and is no longer sending requests
             Err(request::Error::IncompleteRequest(0)) => {
                 log::debug!("Client finished sending requests. Shutting down connection");
