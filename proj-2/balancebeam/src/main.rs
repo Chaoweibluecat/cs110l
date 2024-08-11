@@ -3,13 +3,9 @@ mod response;
 use clap::Parser;
 use core::panic;
 use rand::{Rng, SeedableRng};
-use std::{
-    collections::HashMap,
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    thread,
-};
-use threadpool::ThreadPool;
+use std::{collections::HashMap, sync::Arc, thread};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -53,8 +49,8 @@ struct ProxyState {
     failed_upstream_addresses: Arc<Mutex<Vec<String>>>,
     request_counter: Arc<Mutex<HashMap<String, usize>>>,
 }
-
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize the logging library. You can print log messages using the `log` macros:
     // https://docs.rs/log/0.4.8/log/ You are welcome to continue using print! statements; this
     // just looks a little prettier.
@@ -71,7 +67,7 @@ fn main() {
     }
 
     // Start listening for connections
-    let listener = match TcpListener::bind(&options.bind) {
+    let listener = match TcpListener::bind(&options.bind).await {
         Ok(listener) => listener,
         Err(err) => {
             log::error!("Could not bind to {}: {}", options.bind, err);
@@ -89,72 +85,72 @@ fn main() {
         max_requests_per_minute: options.max_requests_per_minute,
         request_counter: Arc::new(Mutex::new(HashMap::new())),
     });
-    spawn_active_check(state.clone());
-    spawn_counter_clearer(state.clone());
+    spawn_active_check(state.clone()).await;
+    spawn_counter_clearer(state.clone()).await;
 
-    let n_workers = 8;
-    let pool = ThreadPool::new(n_workers);
-
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            let local_state = state.clone();
-            pool.execute(move || {
-                handle_connection(stream, local_state);
-            })
-            // Handle the connection!
-        }
+    while let Ok((stream, _)) = listener.accept().await {
+        let local_state = state.clone();
+        // 启动一个新的异步任务来处理连接
+        tokio::task::spawn(async move {
+            handle_connection(stream, local_state).await;
+        });
+        // Handle the connection!
     }
 }
 
-fn spawn_counter_clearer(state: Arc<ProxyState>) {
+async fn spawn_counter_clearer(state: Arc<ProxyState>) {
     let arc_counter = state.request_counter.clone();
-    thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(60));
-        arc_counter.lock().unwrap().clear();
+    tokio::task::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            arc_counter.lock().await.clear();
+        }
     });
 }
 
-fn spawn_active_check(state: Arc<ProxyState>) {
+async fn spawn_active_check(state: Arc<ProxyState>) {
     let local_arc_alive = state.upstream_addresses.clone();
     let local_arc_failed = state.failed_upstream_addresses.clone();
     let health_path = state.active_health_check_path.clone();
     let interval = state.active_health_check_interval;
-    thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_millis(interval as u64));
-        let mut ips: Vec<String> = local_arc_alive.lock().unwrap().clone();
-        ips.extend(local_arc_failed.lock().unwrap().clone());
-        let mut new_alive = vec![];
-        let mut new_failed = vec![];
-        for ele in ips {
-            if is_active(&ele, &health_path) {
-                new_alive.push(ele);
-            } else {
-                new_failed.push(ele);
+    tokio::task::spawn(async move {
+        loop {
+            thread::sleep(std::time::Duration::from_millis(interval as u64));
+            let mut ips: Vec<String> = local_arc_alive.lock().await.clone();
+            ips.extend(local_arc_failed.lock().await.clone());
+            let mut new_alive = vec![];
+            let mut new_failed = vec![];
+            for ele in ips {
+                if is_active(&ele, &health_path).await {
+                    new_alive.push(ele);
+                } else {
+                    new_failed.push(ele);
+                }
             }
-        }
-        {
-            let mut alive = local_arc_alive.lock().unwrap();
-            alive.clear();
-            alive.extend(new_alive);
-        }
-        {
-            let mut failed = local_arc_failed.lock().unwrap();
-            failed.clear();
-            failed.extend(new_failed);
+            {
+                let mut alive = local_arc_alive.lock().await;
+                alive.clear();
+                alive.extend(new_alive);
+            }
+            {
+                let mut failed = local_arc_failed.lock().await;
+                failed.clear();
+                failed.extend(new_failed);
+            }
         }
     });
 }
 
-fn is_active(ip: &String, path: &String) -> bool {
+async fn is_active(ip: &String, path: &String) -> bool {
     let request = http::Request::builder()
         .method(http::Method::GET)
         .uri(path)
         .header("Host", ip)
         .body(Vec::new())
         .unwrap();
-    match TcpStream::connect(&ip) {
-        Ok(mut connection) => match request::write_to_stream(&request, &mut connection) {
-            Ok(_) => match response::read_from_stream(&mut connection, request.method()) {
+    match TcpStream::connect(&ip).await {
+        Ok(mut connection) => match request::write_to_stream(&request, &mut connection).await {
+            Ok(_) => match response::read_from_stream(&mut connection, request.method()).await {
                 Ok(response) => response.status().as_u16() == 200,
                 Err(_) => false,
             },
@@ -164,10 +160,10 @@ fn is_active(ip: &String, path: &String) -> bool {
     }
 }
 
-fn connect_to_upstream_once(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+async fn connect_to_upstream_once(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     let upstream_ip = {
         let mut rng = rand::rngs::StdRng::from_entropy();
-        let upstream_ref = state.upstream_addresses.lock().unwrap();
+        let upstream_ref = state.upstream_addresses.lock().await;
         if upstream_ref.is_empty() {
             panic!("no available sub ");
         }
@@ -175,53 +171,57 @@ fn connect_to_upstream_once(state: Arc<ProxyState>) -> Result<TcpStream, std::io
         upstream_ref[upstream_idx].clone()
     };
     // 此前的锁只是为了从state中读一个ip出来, 在有io时不要给upstream数组上锁
-    match TcpStream::connect(&upstream_ip) {
+    match TcpStream::connect(&upstream_ip).await {
         Ok(res) => Ok(res),
         Err(err) => {
             log::error!("Failed to connect to upstream {}: {}", &upstream_ip, err);
             // passive fail over
             // upstream_ip lifecycle is over,so we can use state as mut ref;
-            let mut upstreams = state.upstream_addresses.lock().unwrap();
+            let mut upstreams = state.upstream_addresses.lock().await;
             if let Some(idx) = upstreams.iter().position(|x| *x == upstream_ip) {
                 upstreams.swap_remove(idx);
             }
             state
                 .failed_upstream_addresses
                 .lock()
-                .unwrap()
+                .await
                 .push(upstream_ip);
             Err(err)
         }
     }
 }
 
-fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
-    let mut res = connect_to_upstream_once(state.clone());
+async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    let mut res = connect_to_upstream_once(state.clone()).await;
     while res.is_err() {
-        res = connect_to_upstream_once(state.clone());
+        res = connect_to_upstream_once(state.clone()).await;
     }
     res
 }
 
-fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
+async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
-    log::info!("{} <- {}", client_ip, response::format_response_line(&response));
-    if let Err(error) = response::write_to_stream(&response, client_conn) {
+    log::info!(
+        "{} <- {}",
+        client_ip,
+        response::format_response_line(&response)
+    );
+    if let Err(error) = response::write_to_stream(&response, client_conn).await {
         log::warn!("Failed to send response to client: {}", error);
         return;
     }
 }
 
-fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
+async fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state.clone()) {
+    let mut upstream_conn = match connect_to_upstream(state.clone()).await {
         Ok(stream) => stream,
         Err(_error) => {
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
-            send_response(&mut client_conn, &response);
+            send_response(&mut client_conn, &response).await;
             return;
         }
     };
@@ -231,16 +231,16 @@ fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     // client hangs up or we get an error.
     loop {
         // Read a request from the client
-        let mut request = match request::read_from_stream(&mut client_conn) {
+        let mut request = match request::read_from_stream(&mut client_conn).await {
             Ok(request) => {
-                let mut counter = state.request_counter.lock().unwrap();
+                let mut counter = state.request_counter.lock().await;
                 if !counter.contains_key(&client_ip) {
                     counter.insert(client_ip.clone(), 0);
                 }
                 let request_times = *counter.get(&client_ip).unwrap();
                 if request_times >= state.max_requests_per_minute {
                     let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
-                    send_response(&mut client_conn, &response);
+                    send_response(&mut client_conn, &response).await;
                     continue;
                 } else {
                     counter.insert(client_ip.clone(), request_times + 1);
@@ -267,7 +267,7 @@ fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
                     request::Error::RequestBodyTooLarge => http::StatusCode::PAYLOAD_TOO_LARGE,
                     request::Error::ConnectionError(_) => http::StatusCode::SERVICE_UNAVAILABLE,
                 });
-                send_response(&mut client_conn, &response);
+                send_response(&mut client_conn, &response).await;
                 continue;
             }
         };
@@ -284,26 +284,31 @@ fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
         request::extend_header_value(&mut request, "x-forwarded-for", &client_ip);
 
         // Forward the request to the server
-        if let Err(error) = request::write_to_stream(&request, &mut upstream_conn) {
-            log::error!("Failed to send request to upstream {}: {}", upstream_ip, error);
+        if let Err(error) = request::write_to_stream(&request, &mut upstream_conn).await {
+            log::error!(
+                "Failed to send request to upstream {}: {}",
+                upstream_ip,
+                error
+            );
             let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
-            send_response(&mut client_conn, &response);
+            send_response(&mut client_conn, &response).await;
             return;
         }
         log::debug!("Forwarded request to server");
 
         // Read the server's response
-        let response = match response::read_from_stream(&mut upstream_conn, request.method()) {
+        let response = match response::read_from_stream(&mut upstream_conn, request.method()).await
+        {
             Ok(response) => response,
             Err(error) => {
                 log::error!("Error reading response from server: {:?}", error);
                 let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
-                send_response(&mut client_conn, &response);
+                send_response(&mut client_conn, &response).await;
                 return;
             }
         };
         // Forward the response to the client
-        send_response(&mut client_conn, &response);
+        send_response(&mut client_conn, &response).await;
         log::debug!("Forwarded response to client");
     }
 }
